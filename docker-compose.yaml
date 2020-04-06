@@ -1,0 +1,172 @@
+version: '3.1'
+
+volumes:
+    prometheus_data: {}
+    minio_data: {}
+
+services:
+
+  # https://github.com/prometheus/prometheus
+  prometheus:
+    image: prom/prometheus:v2.17.1
+    volumes:
+      - ./prometheus/:/etc/prometheus/
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yaml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.max-block-duration=2m'  # NOTE: あえて 2 分と短くし S3 への保存を早期に確認できる様にしています。
+      - '--storage.tsdb.min-block-duration=2m'  # NOTE: あえて 2 分と短くし S3 への保存を早期に確認できる様にしています。
+      - '--web.enable-lifecycle'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    ports:
+      - 9081:9090
+    links:
+      - cadvisor:cadvisor
+      - alertmanager:alertmanager
+    depends_on:
+      - cadvisor
+    restart: always
+
+  # https://thanos.io/components/sidecar.md/
+  thanos-sidecar:
+    image: quay.io/thanos/thanos:v0.11.0
+    volumes:
+      - ./thanos/:/etc/thanos/
+      - prometheus_data:/prometheus
+    command:
+      - 'sidecar'
+      - '--tsdb.path=/prometheus'
+      - '--prometheus.url=http://prometheus:9090'
+      - '--grpc-address=0.0.0.0:10091'
+      - '--http-address=0.0.0.0:10902'
+      - '--objstore.config-file=/etc/thanos/bucket_config.yaml'
+    depends_on:
+      - prometheus
+      - minio
+    restart: always
+
+  # https://thanos.io/components/query.md/
+  thanos-querier:
+    image: quay.io/thanos/thanos:v0.11.0
+    command:
+      - 'query'
+      - '--grpc-address=0.0.0.0:10091'
+      - '--http-address=0.0.0.0:10902'
+      - '--query.replica-label=replica'
+      - '--store=thanos-sidecar:10091'
+      - '--store=thanos-store-gateway:10091'
+    ports:
+      - 10902:10902
+    depends_on:
+      - thanos-sidecar
+    restart: always
+
+  # https://thanos.io/components/store.md/
+  thanos-store-gateway:
+    image: quay.io/thanos/thanos:v0.11.0
+    volumes:
+      - ./thanos/:/etc/thanos/
+    command:
+      - 'store'
+      - '--grpc-address=0.0.0.0:10091'
+      - '--http-address=0.0.0.0:10902'
+      - '--data-dir=/tmp/thanos/store'
+      - '--objstore.config-file=/etc/thanos/bucket_config.yaml'
+    depends_on:
+      - minio
+    restart: always
+
+  # https://thanos.io/components/compact.md/
+  thanos-compactor:
+    image: quay.io/thanos/thanos:v0.11.0
+    volumes:
+      - ./thanos/:/etc/thanos/
+    command:
+      - 'compact'
+      - '--log.level=debug'
+      - '--data-dir=/data'
+      - '--objstore.config-file=/etc/thanos/bucket_config.yaml'
+      - '--wait'
+    depends_on:
+      - minio
+    restart: always
+
+  # https://thanos.io/components/rule.md/
+  thanos-ruler:
+    image: quay.io/thanos/thanos:v0.11.0
+    volumes:
+      - ./thanos/:/etc/thanos/
+    command:
+      - 'rule'
+      - '--grpc-address=0.0.0.0:10091'
+      - '--http-address=0.0.0.0:10902'
+      - '--log.level=debug'
+      - '--data-dir=/data'
+      - '--eval-interval=15s'
+      - '--rule-file=/etc/thanos/*.rules.yaml'
+      - '--alertmanagers.url=http://alertmanager:9093'
+      - '--query=thanos-querier:10902'
+      - '--objstore.config-file=/etc/thanos/bucket_config.yaml'
+      - "--label=ruler_cluster=\"vegas\""
+      - "--label=ruler_replica=\"r1\""
+    ports:
+      - 10903:10902
+    depends_on:
+      - minio
+      - thanos-querier
+    restart: always
+
+  # https://docs.min.io/
+  minio:
+    image: minio/minio:RELEASE.2020-03-25T07-03-04Z
+    volumes:
+      - minio_data:/data
+    entrypoint: sh
+    command: -c 'mkdir -p /data/demo-bucket && /usr/bin/minio server /data'
+    environment:
+      MINIO_ACCESS_KEY: kenzo0107
+      MINIO_SECRET_KEY: tanoshiiThanos
+    ports:
+      - 9000:9000
+
+  # https://github.com/prometheus/node_exporter
+  node-exporter:
+    image: prom/node-exporter:v0.18.1
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - --collector.filesystem.ignored-mount-points
+      - "^/(sys|proc|dev|host|etc|rootfs/var/lib/docker/containers|rootfs/var/lib/docker/overlay2|rootfs/run/docker/netns|rootfs/var/lib/docker/aufs)($$|/)"
+    ports:
+      - 9100:9100
+    restart: always
+
+  # https://github.com/prometheus/alertmanager
+  alertmanager:
+    image: prom/alertmanager:v0.20.0
+    ports:
+      - 9093:9093
+    volumes:
+      - ./alertmanager/:/etc/alertmanager/
+    restart: always
+    command:
+      - '--config.file=/etc/alertmanager/config.yaml'
+      - '--storage.path=/alertmanager'
+
+  # https://github.com/google/cadvisor
+  cadvisor:
+    image: gcr.io/google_containers/cadvisor:v0.35.0
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:rw
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    ports:
+      - 8080:8080
+    restart: always
